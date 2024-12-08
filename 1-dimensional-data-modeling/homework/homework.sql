@@ -100,17 +100,16 @@ CREATE TABLE actors_history_scd (
     primary key (actorid, start_date),
     actor text,
     actorid text,
-    films film_type[],
     quality_class quality_class,
     is_active boolean,
-    start_date date,
-    end_date date
+    start_date integer,
+    end_date integer
 )
 
 -- Question 4 Backfill query for actors_history_scd: Write a "backfill"
 -- query that can populate the entire actors_history_scd table in a single query.
 
-
+INSERT INTO actors_history_scd
 WITH actor_starting AS (
     SELECT
         actor,
@@ -126,6 +125,8 @@ WITH actor_starting AS (
         -- Detect breaks in continuity
         LAG(current_year) OVER (PARTITION BY actorid ORDER BY current_year) + 1 <> current_year AS year_gap
     FROM actors
+    -- If you wanted to cap the backfill
+    -- WHERE current_year <= 1973
 ),
 detect_changes AS (
     SELECT
@@ -155,12 +156,121 @@ actor_change_groups AS (
     FROM detect_changes
 )
 SELECT
-    actorid,
     actor,
+    actorid,
     quality_class,
     is_active,
     MIN(current_year) AS start_year,
     MAX(current_year) AS end_year
 FROM actor_change_groups
-GROUP BY actorid, actor, quality_class, is_active, actor_change_group
-ORDER BY actor, start_year;
+GROUP BY  actor, actorid, quality_class, is_active, actor_change_group
+
+
+-- Question 5. **Incremental query for `actors_history_scd`:**
+-- Write an "incremental" query that combines the
+-- previous year's SCD data with new incoming data
+-- from the `actors` table.
+
+
+
+-- Create an SCD Type to help
+CREATE TYPE scd_type AS (
+    quality_class quality_class,
+    is_active BOOLEAN,
+    start_date INTEGER,
+    end_date INTEGER
+);
+WITH latest_scd_year AS (
+    SELECT MAX(end_date) AS latest_scd_year
+    FROM actors_history_scd
+),
+historical_scd as (
+    select *
+    from actors_history_scd
+	where end_date = (select latest_scd_year from latest_scd_year)
+
+),
+actual_data as (
+    select *
+    from actors
+    where current_year = (select latest_scd_year + 1 from latest_scd_year)
+),
+unchanged_records as (
+    select
+        act.actor,
+        act.actorid,
+        act.quality_class as quality_class,
+        act.is_active,
+        hist.start_date,
+        act.current_year as end_date
+    from actual_data act
+    join historical_scd hist
+        on act.actorid = hist.actorid
+    where act.quality_class = hist.quality_class
+        and act.is_active = hist.is_active
+),
+
+changed_records as (
+    select
+        act.actor,
+        act.actorid,
+        unnest(
+            array[
+                row(
+                    hist.quality_class,
+                    hist.is_active,
+                    hist.start_date,
+                    hist.end_date
+                )::scd_type,
+                row(
+                    act.quality_class,
+                    act.is_active,
+                    act.current_year,
+                    act.current_year
+                )::scd_type
+            ]
+        ) as records
+
+    from actual_data act
+    left join historical_scd hist
+        on act.actorid = hist.actorid
+    where (act.quality_class <> hist.quality_class
+        or act.is_active <> hist.is_active)
+),
+unnested_changed_records as (
+    select
+        actor,
+        actorid,
+        (records).quality_class,
+        (records).is_active,
+        (records).start_date,
+        (records).end_date
+    from changed_records
+),
+new_records as (
+    select
+        act.actor,
+        act.actorid,
+        act.quality_class as quality_class,
+        act.is_active,
+        act.current_year as start_date,
+        act.current_year as end_date
+    from actual_data act
+    left join historical_scd hist
+        on act.actorid = hist.actorid
+    where hist.actorid is null
+),
+union_records as (
+
+    select *
+    from unchanged_records
+    union all
+    select *
+    from unnested_changed_records
+    union all
+    select *
+    from new_records
+)
+
+select *
+from union_records order by actor ;
